@@ -36,7 +36,13 @@ CDSE_BACKEND = "https://openeo.dataspace.copernicus.eu"
 # ============================================================
 def _get_oidc_config():
     import requests
-    return requests.get(OIDC_URL, timeout=30).json()
+    for attempt in range(3):
+        try:
+            return requests.get(OIDC_URL, timeout=30).json()
+        except:
+            if attempt < 2:
+                time.sleep(5)
+    raise RuntimeError("Cannot reach CDSE identity server. Check VPN.")
 
 
 def _refresh_access_token():
@@ -111,37 +117,40 @@ def _browser_login():
         raise RuntimeError("Login failed: no authorization code received")
 
     print("      Exchanging code for token...")
-    token_resp = requests.post(token_url, data={
-        "grant_type": "authorization_code",
-        "code": code,
-        "redirect_uri": REDIRECT_URI,
-        "client_id": CLIENT_ID,
-    }, timeout=30)
-    token_resp.raise_for_status()
-    try:
-        return token_resp.json()
-    except:
-        print("      [ERROR] Token response was not valid JSON:")
-        print("      " + token_resp.text[:500])
-        raise
-
-
-def _make_connection(access_token):
-    """用 access_token 创建 openEO 连接，带重试"""
-    import requests, time
-    session = requests.Session()
-    session.headers["Authorization"] = "Bearer " + access_token
     for attempt in range(3):
         try:
+            token_resp = requests.post(token_url, data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": REDIRECT_URI,
+                "client_id": CLIENT_ID,
+            }, timeout=30)
+            token_resp.raise_for_status()
+            return token_resp.json()
+        except Exception as e:
+            if attempt < 2:
+                print(f"      [WARN] Token exchange attempt {attempt + 1}/3 failed: {e}")
+                time.sleep(5)
+            else:
+                raise
+
+
+def _make_connection(access_token, max_retries=5):
+    """用 access_token 创建 openEO 连接，带重试"""
+    import requests
+    session = requests.Session()
+    session.headers["Authorization"] = "Bearer " + access_token
+    for attempt in range(max_retries):
+        try:
             conn = openeo.connect(CDSE_BACKEND, session=session)
-            # 测试连接是否真的通了
-            _ = conn.list_collections()
             return conn
         except Exception as e:
-            print(f"      [WARN] Connection attempt {attempt + 1}/3 failed: {e}")
-            if attempt < 2:
-                time.sleep(5)
-    raise RuntimeError("Failed to connect to CDSE after 3 attempts. Check VPN.")
+            print(f"      [WARN] Connection attempt {attempt + 1}/{max_retries} failed: {e}")
+            if attempt < max_retries - 1:
+                wait = (attempt + 1) * 10
+                print(f"      Retrying in {wait}s...")
+                time.sleep(wait)
+    raise RuntimeError(f"Failed to connect to CDSE after {max_retries} attempts. Check VPN.")
 
 
 # ============================================================
@@ -165,19 +174,6 @@ def connect_cdse():
     print("      Connected")
     print()
     return conn
-
-
-def ensure_token_fresh(conn):
-    """每 N 家公司调用一次，主动刷新 token"""
-    token = _refresh_access_token()
-    if token:
-        try:
-            conn._connection._session.headers["Authorization"] = "Bearer " + token
-            print("      [INFO] Token proactively refreshed")
-            return True
-        except:
-            pass
-    return False
 
 
 # ============================================================
@@ -265,17 +261,36 @@ def process_one(conn, row, year, idx):
     except Exception as e:
         err = str(e)
         if "TokenInvalid" in err or "token has expired" in err or "403" in err:
-            # 刷新 token 并重建连接重试
-            new_token = _refresh_access_token()
-            if new_token:
-                try:
-                    new_conn = _make_connection(new_token)
-                    _do_job(new_conn)
-                    return _stats(tif, code, year, idx, png, cmap)
-                except Exception as e2:
-                    return _fail(code, year, idx, "retry_failed: " + str(e2)[:180])
-            else:
-                return _fail(code, year, idx, "token_expired_no_refresh")
+            import requests as req
+            # 拿新token，建全新连接重试
+            if os.path.exists(TOKEN_CACHE):
+                with open(TOKEN_CACHE, "r") as f:
+                    cached = json.load(f)
+                rt = cached.get("refresh_token")
+                if rt:
+                    try:
+                        oidc_conf = req.get(OIDC_URL, timeout=30).json()
+                        resp = req.post(oidc_conf["token_endpoint"], data={
+                            "grant_type": "refresh_token",
+                            "refresh_token": rt,
+                            "client_id": CLIENT_ID,
+                        }, timeout=30)
+                        if resp.status_code == 200:
+                            new_tokens = resp.json()
+                            with open(TOKEN_CACHE, "w") as f:
+                                json.dump(new_tokens, f)
+                            # 建全新连接，不用旧conn
+                            new_sess = req.Session()
+                            new_sess.headers["Authorization"] = "Bearer " + new_tokens["access_token"]
+                            new_conn = openeo.connect(CDSE_BACKEND, session=new_sess)
+                            try:
+                                _do_job(new_conn)
+                                return _stats(tif, code, year, idx, png, cmap)
+                            except Exception as e2:
+                                return _fail(code, year, idx, "retry_err: " + str(e2)[:180])
+                    except Exception as e3:
+                        return _fail(code, year, idx, "refresh_err: " + str(e3)[:180])
+            return _fail(code, year, idx, "token_expired")
         return _fail(code, year, idx, err[:200])
 
 def run(conn, df):
@@ -288,15 +303,48 @@ def run(conn, df):
     print("      ~2 min/job, est ~{:.0f} hours".format(n_jobs * 2.5 / 60))
     print()
     ok = fail = 0
-    for i, (_, row) in enumerate(df.iterrows()):
-        # 每15家公司主动刷新一次 token
-        if i > 0 and i % 15 == 0:
-            ensure_token_fresh(conn)
 
+    # 获取新 token 的辅助函数
+    def _get_fresh_token():
+        # 先尝试从缓存刷新
+        if os.path.exists(TOKEN_CACHE):
+            with open(TOKEN_CACHE, "r") as f:
+                cached = json.load(f)
+            rt = cached.get("refresh_token")
+            if rt:
+                import requests as req
+                try:
+                    oidc_conf = req.get(OIDC_URL, timeout=30).json()
+                    resp = req.post(oidc_conf["token_endpoint"], data={
+                        "grant_type": "refresh_token",
+                        "refresh_token": rt,
+                        "client_id": CLIENT_ID,
+                    }, timeout=30)
+                    if resp.status_code == 200:
+                        new_tokens = resp.json()
+                        # 更新缓存
+                        with open(TOKEN_CACHE, "w") as f:
+                            json.dump(new_tokens, f)
+                        return new_tokens["access_token"]
+                except:
+                    pass
+        # 缓存刷新失败，弹浏览器
+        tokens = _browser_login()
+        with open(TOKEN_CACHE, "w") as f:
+            json.dump(tokens, f)
+        return tokens["access_token"]
+
+    for i, (_, row) in enumerate(df.iterrows()):
         code = row["code"];
         name = row["name"][:25];
         ind = row["industry"];
         grp = row["group"]
+
+        # 每家公司新建一个连接，避免库状态累积
+        if i > 0:
+            token = _get_fresh_token()
+            conn = _make_connection(token)
+
         for year in YEARS:
             for idx_name in indices:
                 tag = "[{:02d}/{}] {} {} {}".format(i + 1, total, code, year, idx_name)

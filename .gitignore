@@ -1,0 +1,16 @@
+﻿# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Temp files
+temp_*.py
+temp_*.txt
+temp_*.json
+
+# IDE
+.vscode/
+.idea/
+
+# Conda env
+.env

@@ -1,0 +1,10 @@
+
+000488: industry=造纸 group=独立测试集 name=山东晨鸣纸业集团股份有限公司
+   reason: nan
+
+600256: industry=石化 group=独立测试集 name=广汇能源股份有限公司
+   reason: nan
+
+000554: NOT IN EXCEL
+
+002511: NOT IN EXCEL

@@ -1,16 +1,13 @@
 ﻿# -*- coding: utf-8 -*-
 """
 CDSE openEO Batch NDVI + NDWI Extraction - Async Batch Jobs
-Uses rasterio for GeoTIFF output. No rate-limit issues. Resume-safe.
-Requires: openeo, rasterio, pandas, numpy, matplotlib, pillow
+Same simple approach as batch_cdse_rgb.py (authenticate_oidc, no custom auth).
+Requires: openeo, rasterio, pandas, numpy, matplotlib
 """
 import openeo, rasterio, pandas as pd, numpy as np
-import matplotlib;
-
-matplotlib.use("Agg")
+import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import os, sys, time, warnings, json
-
+import os, time, warnings
 warnings.filterwarnings("ignore")
 
 ROOT = r"C:\Users\28129\Desktop\共享1-数据收集与核对"
@@ -20,181 +17,31 @@ PNG_DIR = os.path.join(OUT_DIR, "ndvi_previews")
 os.makedirs(TIF_DIR, exist_ok=True)
 os.makedirs(PNG_DIR, exist_ok=True)
 
-COORDS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "company_coordinates.csv")
+COORDS_FILE = os.path.join(ROOT, "scripts", "company_coordinates.csv")
 RESULTS_CSV = os.path.join(OUT_DIR, "ndvi_results.csv")
-BUFFER_DEG = 0.009;
-YEARS = [2019, 2021];
-CLOUD_MAX = 20
+BUFFER_DEG = 0.009; YEARS = [2019, 2021]; CLOUD_MAX = 20
 
-TOKEN_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cdse_tokens.json")
-CLIENT_ID = "cdse-public"
-REDIRECT_URI = "http://localhost:8080"
-OIDC_URL = "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/.well-known/openid-configuration"
-CDSE_BACKEND = "https://openeo.dataspace.copernicus.eu"
-
-
-# ============================================================
-def _get_oidc_config():
-    import requests
-    for attempt in range(3):
-        try:
-            return requests.get(OIDC_URL, timeout=30).json()
-        except:
-            if attempt < 2:
-                time.sleep(5)
-    raise RuntimeError("Cannot reach CDSE identity server. Check VPN.")
-
-
-def _refresh_access_token():
-    """用本地缓存的 refresh_token 获取新 access_token，成功返回 token 否则 None"""
-    import requests
-    if not os.path.exists(TOKEN_CACHE):
-        return None
-    with open(TOKEN_CACHE, "r") as f:
-        cached = json.load(f)
-    rt = cached.get("refresh_token")
-    if not rt:
-        return None
-    try:
-        oidc = _get_oidc_config()
-        resp = requests.post(oidc["token_endpoint"], data={
-            "grant_type": "refresh_token",
-            "refresh_token": rt,
-            "client_id": CLIENT_ID,
-        }, timeout=30)
-        if resp.status_code == 200:
-            tokens = resp.json()
-            with open(TOKEN_CACHE, "w") as f:
-                json.dump(tokens, f)
-            return tokens["access_token"]
-    except:
-        pass
-    return None
-
-
-def _browser_login():
-    """弹出浏览器登录，返回 tokens dict"""
-    import requests, webbrowser, urllib.parse, http.server, threading, queue
-
-    oidc = _get_oidc_config()
-    token_url = oidc["token_endpoint"]
-    auth_url = oidc["authorization_endpoint"]
-
-    params = {
-        "client_id": CLIENT_ID,
-        "redirect_uri": REDIRECT_URI,
-        "response_type": "code",
-        "scope": "openid",
-        "state": "cdse_auth",
-    }
-    login_url = auth_url + "?" + urllib.parse.urlencode(params)
-
-    q = queue.Queue()
-
-    class Handler(http.server.BaseHTTPRequestHandler):
-        def do_GET(self):
-            parsed = urllib.parse.urlparse(self.path)
-            query = urllib.parse.parse_qs(parsed.query)
-            q.put(query.get("code", [None])[0])
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"Login OK. You may close this window.")
-
-        def log_message(self, format, *args):
-            pass
-
-    server = http.server.HTTPServer(("localhost", 8080), Handler)
-    t = threading.Thread(target=server.serve_forever, daemon=True)
-    t.start()
-
-    print("      Opening browser for login...")
-    webbrowser.open(login_url)
-
-    code = q.get(timeout=120)
-    server.shutdown()
-
-    if not code:
-        raise RuntimeError("Login failed: no authorization code received")
-
-    print("      Exchanging code for token...")
-    for attempt in range(3):
-        try:
-            token_resp = requests.post(token_url, data={
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": REDIRECT_URI,
-                "client_id": CLIENT_ID,
-            }, timeout=30)
-            token_resp.raise_for_status()
-            return token_resp.json()
-        except Exception as e:
-            if attempt < 2:
-                print(f"      [WARN] Token exchange attempt {attempt + 1}/3 failed: {e}")
-                time.sleep(5)
-            else:
-                raise
-
-
-def _make_connection(access_token, max_retries=5):
-    """用 access_token 创建 openEO 连接，带重试"""
-    import requests
-    session = requests.Session()
-    session.headers["Authorization"] = "Bearer " + access_token
-    for attempt in range(max_retries):
-        try:
-            conn = openeo.connect(CDSE_BACKEND, session=session)
-            return conn
-        except Exception as e:
-            print(f"      [WARN] Connection attempt {attempt + 1}/{max_retries} failed: {e}")
-            if attempt < max_retries - 1:
-                wait = (attempt + 1) * 10
-                print(f"      Retrying in {wait}s...")
-                time.sleep(wait)
-    raise RuntimeError(f"Failed to connect to CDSE after {max_retries} attempts. Check VPN.")
-
-
-# ============================================================
 def connect_cdse():
-    print("[1/4] Connecting to CDSE ...")
-
-    # 先尝试用本地缓存静默刷新
-    token = _refresh_access_token()
-    if token:
-        conn = _make_connection(token)
-        print("      Connected (cached token refreshed)")
-        print()
-        return conn
-
-    # 缓存不可用，弹浏览器登录
-    tokens = _browser_login()
-    with open(TOKEN_CACHE, "w") as f:
-        json.dump(tokens, f)
-
-    conn = _make_connection(tokens["access_token"])
-    print("      Connected")
-    print()
+    print("[1/3] Connecting to CDSE ...")
+    conn = openeo.connect("https://openeo.dataspace.copernicus.eu")
+    conn.authenticate_oidc()
+    print("      Connected\n")
     return conn
 
-
-# ============================================================
 def load_coords():
-    df = pd.read_csv(COORDS_FILE, encoding="utf-8-sig").dropna(subset=["lat", "lon"])
+    df = pd.read_csv(COORDS_FILE, encoding="utf-8-sig").dropna(subset=["lat","lon"])
     df["code"] = df["code"].apply(lambda x: str(int(x)).zfill(6))
-    print("[2/4] Loaded {} companies".format(len(df)))
-    print()
+    print("[2/3] Loaded {} companies\n".format(len(df)))
     return df
-
 
 def _fail(code, year, idx, reason):
     return {"code": code, "year": year, "index": idx, "status": reason,
             "mean": None, "std": None, "min": None, "max": None,
             "p10": None, "p90": None, "valid_pixels": 0}
 
-
 def _stats(tif_path, code, year, idx, png_path, cmap, cached=False):
     with rasterio.open(tif_path) as src:
-        arr = src.read(1)
-        nd = src.nodata
+        arr = src.read(1); nd = src.nodata
     vals = arr.flatten()
     if nd is not None and not (isinstance(nd, float) and np.isnan(nd)):
         vals = vals[vals != nd]
@@ -211,167 +58,68 @@ def _stats(tif_path, code, year, idx, png_path, cmap, cached=False):
          "valid_pixels": int(len(vals)),
          "status": "ok_cached" if cached else "ok"}
     try:
-        vmin_, vmax_ = {"NDVI": (-0.2, 0.8), "NDWI": (-1.0, 1.0)}.get(idx, (-1.0, 1.0))
-        plt.figure(figsize=(6, 6))
+        vmin_, vmax_ = {"NDVI":(-0.2,0.8),"NDWI":(-1.0,1.0)}.get(idx, (-1.0,1.0))
+        plt.figure(figsize=(6,6))
         plt.imshow(arr, cmap=cmap, vmin=vmin_, vmax=vmax_)
         plt.colorbar(label=idx)
         plt.title("{} {} {} mean={:.3f}{}".format(code, year, idx, m, tag))
-        plt.axis("off");
-        plt.savefig(png_path, dpi=100, bbox_inches="tight");
-        plt.close()
-    except:
-        pass
+        plt.axis("off"); plt.savefig(png_path, dpi=100, bbox_inches="tight"); plt.close()
+    except: pass
     return s
 
-
 def process_one(conn, row, year, idx):
-    code = row["code"];
+    code = row["code"]; name = row["name"]
     lat, lon = float(row["lat"]), float(row["lon"])
-    w, s = lon - BUFFER_DEG, lat - BUFFER_DEG;
-    e, n = lon + BUFFER_DEG, lat + BUFFER_DEG
+    w, s = lon-BUFFER_DEG, lat-BUFFER_DEG; e, n = lon+BUFFER_DEG, lat+BUFFER_DEG
     tif = os.path.join(TIF_DIR, "{}_{}_{}.tif".format(code, year, idx.lower()))
     png = os.path.join(PNG_DIR, "{}_{}_{}.png".format(code, year, idx.lower()))
-    cmap = {"NDVI": "RdYlGn", "NDWI": "Blues"}.get(idx, "RdYlGn")
+    cmap = {"NDVI":"RdYlGn","NDWI":"Blues"}.get(idx, "RdYlGn")
 
-    # Resume: skip if already downloaded
     if os.path.exists(tif) and os.path.getsize(tif) > 1000:
         return _stats(tif, code, year, idx, png, cmap, True)
 
-    bands = ["B04", "B08"] if idx == "NDVI" else ["B03", "B08"]
-
-    def _do_job(c):
-        cube = c.load_collection(collection_id="SENTINEL2_L2A",
-                                 spatial_extent={"west": w, "south": s, "east": e, "north": n},
-                                 temporal_extent=["{}-06-01".format(year), "{}-08-31".format(year)],
-                                 bands=bands, max_cloud_cover=CLOUD_MAX)
-        if idx == "NDVI":
-            result = cube.ndvi(nir="B08", red="B04")
-        else:
-            result = (cube.band("B03") - cube.band("B08")) / (cube.band("B03") + cube.band("B08"))
+    bands = ["B04","B08"] if idx=="NDVI" else ["B03","B08"]
+    try:
+        cube = conn.load_collection(collection_id="SENTINEL2_L2A",
+            spatial_extent={"west":w,"south":s,"east":e,"north":n},
+            temporal_extent=["{}-06-01".format(year),"{}-08-31".format(year)],
+            bands=bands, max_cloud_cover=CLOUD_MAX)
+        if idx=="NDVI": result = cube.ndvi(nir="B08", red="B04")
+        else: result = (cube.band("B03")-cube.band("B08"))/(cube.band("B03")+cube.band("B08"))
         reduced = result.reduce_temporal(reducer="median")
         job = reduced.create_job(title="{}_{}_{}".format(idx.lower(), code, year))
-        print("    job {} ...".format(job.job_id), end=" ")
         job.start_and_wait()
-        print("done", end=" ")
         job.get_results().download_file(tif)
-
-    try:
-        _do_job(conn)
         return _stats(tif, code, year, idx, png, cmap)
     except Exception as e:
-        err = str(e)
-        if "TokenInvalid" in err or "token has expired" in err or "403" in err:
-            import requests as req
-            # 拿新token，建全新连接重试
-            if os.path.exists(TOKEN_CACHE):
-                with open(TOKEN_CACHE, "r") as f:
-                    cached = json.load(f)
-                rt = cached.get("refresh_token")
-                if rt:
-                    try:
-                        oidc_conf = req.get(OIDC_URL, timeout=30).json()
-                        resp = req.post(oidc_conf["token_endpoint"], data={
-                            "grant_type": "refresh_token",
-                            "refresh_token": rt,
-                            "client_id": CLIENT_ID,
-                        }, timeout=30)
-                        if resp.status_code == 200:
-                            new_tokens = resp.json()
-                            with open(TOKEN_CACHE, "w") as f:
-                                json.dump(new_tokens, f)
-                            # 建全新连接，不用旧conn
-                            new_sess = req.Session()
-                            new_sess.headers["Authorization"] = "Bearer " + new_tokens["access_token"]
-                            new_conn = openeo.connect(CDSE_BACKEND, session=new_sess)
-                            try:
-                                _do_job(new_conn)
-                                return _stats(tif, code, year, idx, png, cmap)
-                            except Exception as e2:
-                                return _fail(code, year, idx, "retry_err: " + str(e2)[:180])
-                    except Exception as e3:
-                        return _fail(code, year, idx, "refresh_err: " + str(e3)[:180])
-            return _fail(code, year, idx, "token_expired")
-        return _fail(code, year, idx, err[:200])
+        return _fail(code, year, idx, str(e)[:150])
 
 def run(conn, df):
-    results = [];
-    total = len(df);
-    indices = ["NDVI", "NDWI"]
+    results = []; total = len(df); indices = ["NDVI","NDWI"]
     n_jobs = total * len(YEARS) * len(indices)
-    print("[3/4] {} cos x {} yrs x {} idx = {} jobs (async batch)".format(
-        total, len(YEARS), len(indices), n_jobs))
-    print("      ~2 min/job, est ~{:.0f} hours".format(n_jobs * 2.5 / 60))
-    print()
+    print("[3/3] {} cos x {} yrs x {} idx = {} jobs, est ~{:.0f}h\n".format(
+        total, len(YEARS), len(indices), n_jobs, n_jobs*2.5/60))
     ok = fail = 0
-
-    # 获取新 token 的辅助函数
-    def _get_fresh_token():
-        # 先尝试从缓存刷新
-        if os.path.exists(TOKEN_CACHE):
-            with open(TOKEN_CACHE, "r") as f:
-                cached = json.load(f)
-            rt = cached.get("refresh_token")
-            if rt:
-                import requests as req
-                try:
-                    oidc_conf = req.get(OIDC_URL, timeout=30).json()
-                    resp = req.post(oidc_conf["token_endpoint"], data={
-                        "grant_type": "refresh_token",
-                        "refresh_token": rt,
-                        "client_id": CLIENT_ID,
-                    }, timeout=30)
-                    if resp.status_code == 200:
-                        new_tokens = resp.json()
-                        # 更新缓存
-                        with open(TOKEN_CACHE, "w") as f:
-                            json.dump(new_tokens, f)
-                        return new_tokens["access_token"]
-                except:
-                    pass
-        # 缓存刷新失败，弹浏览器
-        tokens = _browser_login()
-        with open(TOKEN_CACHE, "w") as f:
-            json.dump(tokens, f)
-        return tokens["access_token"]
-
     for i, (_, row) in enumerate(df.iterrows()):
-        code = row["code"];
-        name = row["name"][:25];
-        ind = row["industry"];
-        grp = row["group"]
-
-        # 每家公司新建一个连接，避免库状态累积
-        if i > 0:
-            token = _get_fresh_token()
-            conn = _make_connection(token)
-
+        code = row["code"]; name = row["name"][:25]; ind = row["industry"]; grp = row["group"]
         for year in YEARS:
             for idx_name in indices:
-                tag = "[{:02d}/{}] {} {} {}".format(i + 1, total, code, year, idx_name)
-                print("  {}  {}/{}  {}".format(tag, ind, grp, name), end=" ")
+                tag = "[{:02d}/{}] {} {} {}".format(i+1, total, code, year, idx_name)
+                print("  {}  {}/{}  {}".format(tag, ind, grp, name), end=" ", flush=True)
                 r = process_one(conn, row, year, idx_name)
-                r["name"] = row["name"];
-                r["industry"] = ind;
-                r["group"] = grp;
-                results.append(r)
-                if r["status"] in ("ok", "ok_cached"):
-                    ok += 1; print("=> mean={:.4f}".format(r["mean"]))
-                else:
-                    fail += 1; print("=> {}".format(r["status"]))
+                r["name"]=row["name"]; r["industry"]=ind; r["group"]=grp; results.append(r)
+                if r["status"] in ("ok","ok_cached"): ok+=1; print("=> mean={:.4f}".format(r["mean"]))
+                else: fail+=1; print("=> {}".format(r["status"]))
                 time.sleep(2)
         pd.DataFrame(results).to_csv(RESULTS_CSV, index=False, encoding="utf-8-sig")
-        print("      [{}/{} ok, {} fail] saved".format(ok, (i + 1) * len(YEARS) * len(indices), fail))
-        print()
-    print()
-    print("[4/4] Done. ok={}/{}".format(ok, len(results)))
+        print("      [{}/{} ok, {} fail] saved\n".format(ok, (i+1)*len(YEARS)*len(indices), fail))
+    print("\nDone. ok={}/{}".format(ok, len(results)))
     for r in results:
-        if r["status"] not in ("ok", "ok_cached"):
+        if r["status"] not in ("ok","ok_cached"):
             print("  FAIL {} {} {} {}".format(r["code"], r["year"], r["index"], r["status"]))
-    return pd.DataFrame(results)
-
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("  CDSE openEO - NDVI+NDWI Batch (async + rasterio)")
-    print("=" * 60)
+    print("="*60)
+    print("  CDSE openEO - NDVI+NDWI Batch (async, simple auth)")
+    print("="*60)
     run(connect_cdse(), load_coords())
